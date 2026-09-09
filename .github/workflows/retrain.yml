@@ -1,0 +1,71 @@
+name: Reentrenar modelos MLB
+
+# Corre el reentrenamiento completo (retrain_pipeline.py) en un servidor de
+# GitHub en vez de en el navegador/Streamlit Cloud - no depende de que una
+# pestana se quede conectada 20-45 minutos, y tiene mucha mas RAM disponible
+# (elimina el riesgo de quedarse sin memoria que tenia en Streamlit Cloud).
+#
+# Se puede disparar de 3 formas:
+#   1. Solo, todos los dias (cron de abajo) - pero retrain_pipeline.py se
+#      auto-frena y no hace nada si el ultimo reentrenamiento fue hace
+#      menos de 3 dias (--min-days-between, default 3), asi que en la
+#      practica reentrena cada ~3 dias como se queria.
+#   2. A mano desde GitHub: pestana "Actions" -> "Reentrenar modelos MLB" ->
+#      "Run workflow".
+#   3. A mano desde la terminal: gh workflow run retrain.yml
+#
+# Por que diario y no "cron cada 3 dias" directo: la sintaxis obvia
+# ("0 9 */3 * *") NO significa "cada 3 dias desde hoy" - en el campo de
+# dia-del-mes de cron, */3 se cuenta desde el dia 1 del mes (dias 1,4,7...),
+# lo cual ademas se corta feo en el cambio de mes. Ademas, GitHub retrasa o
+# de plano SALTA corridas programadas sin avisar durante picos de carga -
+# con un disparo cada 3 dias exacto, un solo salto deja el modelo
+# desactualizado varios dias de mas sin que nadie se de cuenta. Con un
+# disparo diario + el freno de --min-days-between, el peor caso de un salto
+# es reentrenar un dia tarde, no varios.
+on:
+  schedule:
+    - cron: "0 9 * * *"  # 09:00 UTC (~03:00 hora de Mexico) todos los dias
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  reentrenar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Reentrenar (evalua + recolecta + clima + entrena los 8 modelos)
+        run: python retrain_pipeline.py
+
+      - name: Guardar modelos y datos actualizados en el repo
+        run: |
+          git config user.name "MLB Apuestas Bot"
+          git config user.email "mlb-apuestas-bot@users.noreply.github.com"
+          # predictions_log.csv NO se sube desde aqui: la app en Streamlit
+          # Cloud tambien lo modifica (cada reporte que alguien genera) y
+          # puede pasar al mismo tiempo que este workflow corre - dos
+          # escrituras reales al mismo archivo causan un conflicto de
+          # contenido que un rebase no puede resolver solo (ya paso). El
+          # paso de evaluar predicciones (arriba) sigue corriendo para ver
+          # las metricas en este log, solo no se persiste su copia local.
+          git checkout -- predictions_log.csv 2>/dev/null || true
+          git add model*.joblib* training_data.csv training_history.csv \
+                  training_history_matchup.csv
+          git diff --cached --quiet || git commit -m "Reentrenamiento automatico (GitHub Actions) $(date -u +%Y-%m-%d)"
+          # Si alguien mas subio un commit mientras esto corria (20-45 min),
+          # un push directo se rechaza (non-fast-forward). Rebase encima de
+          # lo mas reciente antes de subir - ya no deberia haber conflicto
+          # de contenido real, los demas archivos solo los toca este job.
+          git pull --rebase origin main
+          git push
